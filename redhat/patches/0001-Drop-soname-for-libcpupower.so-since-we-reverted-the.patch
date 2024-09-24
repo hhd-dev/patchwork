@@ -1,0 +1,26 @@
+From b3dcb6b415ea6e53d5d6c7c442432386aa38fbd5 Mon Sep 17 00:00:00 2001
+From: "Justin M. Forbes" <jforbes@fedoraproject.org>
+Date: Fri, 19 Jan 2024 09:55:22 -0600
+Subject: [PATCH] Drop soname for libcpupower.so since we reverted the bump
+
+Signed-off-by: Justin M. Forbes <jforbes@fedoraproject.org>
+---
+ redhat/kernel.spec.template | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/redhat/kernel.spec.template b/redhat/kernel.spec.template
+index c3a8d570d48a..2f1474758419 100644
+--- a/redhat/kernel.spec.template
++++ b/redhat/kernel.spec.template
+@@ -3603,7 +3603,7 @@ fi\
+ 
+ %ifarch %{cpupowerarchs}
+ %files -n %{package_name}-tools-libs
+-%{_libdir}/libcpupower.so.1
++%{_libdir}/libcpupower.so.0
+ %{_libdir}/libcpupower.so.0.0.1
+ 
+ %files -n %{package_name}-tools-libs-devel
+-- 
+2.44.0
+

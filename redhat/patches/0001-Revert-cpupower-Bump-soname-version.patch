@@ -1,0 +1,33 @@
+From 46a8350ec1068377bdfcd55191012325f85113bb Mon Sep 17 00:00:00 2001
+From: "Justin M. Forbes" <jforbes@fedoraproject.org>
+Date: Wed, 17 Jan 2024 15:02:31 -0600
+Subject: [PATCH] Revert "cpupower: Bump soname version"
+
+In preperation to bring kernel-tools back into the kernel package, this
+needs to be reverted for F39 and F38. The actual change to justify the
+soname bump were years ago, so let's leave userspace be and pick this up
+in F40.
+
+This reverts commit d7de5d8e403a1293e10f8f59a1f2db320232c831.
+
+Signed-off-by: Justin M. Forbes <jforbes@fedoraproject.org>
+---
+ tools/power/cpupower/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tools/power/cpupower/Makefile b/tools/power/cpupower/Makefile
+index b53753dee02f..90701fc65aa2 100644
+--- a/tools/power/cpupower/Makefile
++++ b/tools/power/cpupower/Makefile
+@@ -53,7 +53,7 @@ DESTDIR ?=
+ 
+ VERSION:=			$(shell ./utils/version-gen.sh)
+ LIB_MAJ=			0.0.1
+-LIB_MIN=			1
++LIB_MIN=			0
+ 
+ PACKAGE =			cpupower
+ PACKAGE_BUGREPORT =		linux-pm@vger.kernel.org
+-- 
+2.44.0
+
