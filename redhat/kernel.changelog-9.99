@@ -1,3 +1,7 @@
+* Fri Oct 04 2024 Justin M. Forbes <jforbes@fedoraproject.org> [6.11.2-0]
+- Linux v6.11.2
+Resolves: 
+
 * Mon Sep 30 2024 Justin M. Forbes <jforbes@fedoraproject.org> [6.11.1-0]
 - media: qcom: camss: Fix ordering of pm_runtime_enable (Bryan O'Donoghue)
 - media: qcom: camss: Remove use_count guard in stop_streaming (Bryan O'Donoghue)
