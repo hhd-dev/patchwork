@@ -1,3 +1,18 @@
+* Thu Oct 10 2024 Justin M. Forbes <jforbes@fedoraproject.org> [6.11.3-0]
+- Add bugs to BugsFixed (Justin M. Forbes)
+- HID: amd_sfh: Switch to device-managed dmam_alloc_coherent() (Basavaraj Natikar)
+- wifi: rtw89: pci: early chips only enable 36-bit DMA on specific PCI hosts (Ping-Ke Shih)
+- HID: lenovo: Add support for Thinkpad X1 Tablet Gen 3 keyboard (Hans de Goede)
+- configs: fedora/x86: Set CONFIG_CRYPTO_DEV_CCP_DD=y (Hans de Goede)
+- common: arm64: build in some SCMI options (Peter Robinson)
+- common: Cleanup ARM_SCMI_TRANSPORT options (Peter Robinson)
+- Another BugsFixed entry (Justin M. Forbes)
+- Add bug to BugsFixed (Justin M. Forbes)
+- Turn on ZRAM_WRITEBACK for Fedora (Justin M. Forbes)
+- Config updates for 6.11.3 (Justin M. Forbes)
+- Linux v6.11.3
+Resolves: 
+
 * Fri Oct 04 2024 Justin M. Forbes <jforbes@fedoraproject.org> [6.11.2-0]
 - Linux v6.11.2
 Resolves: 
