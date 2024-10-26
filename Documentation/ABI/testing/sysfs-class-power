@@ -404,12 +404,15 @@ Description:
 			The charger bypasses the charging path around the
 			integrated converter allowing for a "smart" wall
 			adaptor to perform the power conversion externally.
+		BypassS0:
+			Same as Bypass, but applied only when the device is
+			in S0 and automatically disabled in states S3-S5.
 
 		Access: Read, Write
 
 		Valid values:
 			      "Unknown", "N/A", "Trickle", "Fast", "Standard",
-			      "Adaptive", "Custom", "Long Life", "Bypass"
+			      "Adaptive", "Custom", "Long Life", "Bypass", "BypassS0"
 
 What:		/sys/class/power_supply/<supply_name>/charge_term_current
 Date:		July 2014
