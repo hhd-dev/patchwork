@@ -47,8 +47,8 @@ static const struct acpi_device_id lps0_device_ids[] = {
 #define ACPI_LPS0_DISPLAY_ON	4
 #define ACPI_LPS0_ENTRY		5
 #define ACPI_LPS0_EXIT		6
-#define ACPI_LPS0_MS_ENTRY      7
-#define ACPI_LPS0_MS_EXIT       8
+#define ACPI_LPS0_SLEEP_ENTRY      7
+#define ACPI_LPS0_SLEEP_EXIT       8
 
 /* AMD */
 #define ACPI_LPS0_DSM_UUID_AMD      "e3f32452-febc-43ce-9039-932122d37721"
@@ -353,10 +353,10 @@ static const char *acpi_sleep_dsm_state_to_str(unsigned int state)
 			return "lps0 entry";
 		case ACPI_LPS0_EXIT:
 			return "lps0 exit";
-		case ACPI_LPS0_MS_ENTRY:
-			return "lps0 ms entry";
-		case ACPI_LPS0_MS_EXIT:
-			return "lps0 ms exit";
+		case ACPI_LPS0_SLEEP_ENTRY:
+			return "sleep entry";
+		case ACPI_LPS0_SLEEP_EXIT:
+			return "sleep exit";
 		}
 	} else {
 		switch (state) {
@@ -608,7 +608,7 @@ static int acpi_s2idle_prepare_late_lps0(void)
 
 	if (lps0_dsm_func_mask_microsoft > 0) {
 		/* Modern Standby entry */
-		acpi_sleep_run_lps0_dsm(ACPI_LPS0_MS_ENTRY,
+		acpi_sleep_run_lps0_dsm(ACPI_LPS0_SLEEP_ENTRY,
 				lps0_dsm_func_mask_microsoft, lps0_dsm_guid_microsoft);
 		acpi_sleep_run_lps0_dsm(ACPI_LPS0_ENTRY,
 				lps0_dsm_func_mask_microsoft, lps0_dsm_guid_microsoft);
@@ -661,7 +661,7 @@ static void acpi_s2idle_restore_early_lps0(void)
 		acpi_sleep_run_lps0_dsm(ACPI_LPS0_EXIT,
 				lps0_dsm_func_mask_microsoft, lps0_dsm_guid_microsoft);
 		/* Modern Standby exit */
-		acpi_sleep_run_lps0_dsm(ACPI_LPS0_MS_EXIT,
+		acpi_sleep_run_lps0_dsm(ACPI_LPS0_SLEEP_EXIT,
 				lps0_dsm_func_mask_microsoft, lps0_dsm_guid_microsoft);
 	}
 }
