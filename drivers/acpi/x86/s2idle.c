@@ -101,6 +101,7 @@ struct s2idle_delay_quirks {
 	int delay_sleep_entry;
 	int delay_sleep_exit;
 	int delay_display_on;
+	int delay_begin;
 };
 
 /*
@@ -118,6 +119,10 @@ static const struct s2idle_delay_quirks rog_ally_quirks = {
 	.delay_sleep_entry = 150,
 };
 
+static const struct s2idle_delay_quirks legion_go_s_quirks = {
+	.delay_begin = 500,
+};
+
 static const struct dmi_system_id s2idle_delay_quirks[] = {
 	{
 		.matches = {
@@ -130,6 +135,31 @@ static const struct dmi_system_id s2idle_delay_quirks[] = {
 			DMI_MATCH(DMI_BOARD_NAME, "RC72L"),
 		},
 		.driver_data = (void *)&rog_ally_quirks
+	},
+	/* Legion Go S */
+	{
+		.matches = {
+			DMI_MATCH(DMI_PRODUCT_NAME, "83L3"),
+		},
+		.driver_data = (void *)&legion_go_s_quirks
+	},
+	{
+		.matches = {
+			DMI_MATCH(DMI_PRODUCT_NAME, "83N6"),
+		},
+		.driver_data = (void *)&legion_go_s_quirks
+	},
+	{
+		.matches = {
+			DMI_MATCH(DMI_PRODUCT_NAME, "83Q2"),
+		},
+		.driver_data = (void *)&legion_go_s_quirks
+	},
+	{
+		.matches = {
+			DMI_MATCH(DMI_PRODUCT_NAME, "83Q3"),
+		},
+		.driver_data = (void *)&legion_go_s_quirks
 	},
 	{}
 };
