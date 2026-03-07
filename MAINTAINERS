@@ -731,6 +731,11 @@ S:	Maintained
 F:	drivers/scsi/aha152x*
 F:	drivers/scsi/pcmcia/aha152x*
 
+AI CODING ASSISTANTS
+M:	Antheas Kapenekakis <lkml@antheas.dev>
+S:	Maintained
+F:	scripts/agent/
+
 AIC7XXX / AIC79XX SCSI DRIVER
 M:	Hannes Reinecke <hare@suse.com>
 L:	linux-scsi@vger.kernel.org
