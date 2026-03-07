@@ -57,3 +57,29 @@ Basic development tools (git, gcc, make, editors) should not be listed.
 Example::
 
   Assisted-by: Claude:claude-3-opus coccinelle sparse
+
+Agent Configuration
+===================
+
+The kernel ships a template agent instructions file at
+``scripts/agent/AGENTS.md``. It encodes standard kernel workflow patterns
+(checkpatch, format-patch, changelogs, git send-email) so that AI
+assistants follow established conventions out of the box.
+
+These files are personal to each developer and are listed in
+``.gitignore``. To get started, copy the template to the root of
+your kernel tree::
+
+  cp scripts/agent/AGENTS.md AGENTS.md
+
+Rename the copy if your tool expects a specific filename. Then
+edit it to add your own agent and model version, test targets,
+build flags, or workflow preferences. In particular, adjust the
+``Assisted-by`` tag to match your setup. Because the copy is
+gitignored it will not pollute the tree.
+
+Then, you can add a testing section. For example, if you have a device
+named as X in your ssh config, instruct the agent to use ``ssh X``
+to run tests on that device, and add some bash boilerplate instructing it
+how to sync kernels and modules to the device (e.g., ``make pacman-pkg``,
+``rsync``, ``sudo pacman -U linux-upstream-*`` for an Arch target).
