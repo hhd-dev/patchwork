@@ -184,3 +184,8 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+# AI agent configuration
+/AGENTS.md
+/CLAUDE.md
+/agent
