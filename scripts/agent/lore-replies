@@ -1,0 +1,872 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+#
+# lore-replies - Fetch and display a lore.kernel.org thread with inline
+#                conversations, rendered like a threaded forum.
+#
+# Usage:
+#   lore-replies <message-id-or-url> [--untruncated]
+#
+# Example:
+#   lore-replies https://lore.kernel.org/all/20260307115516.26892-1-lkml@antheas.dev/
+#   217k reply chars -> 18k output (91% reduction)
+
+import sys
+import os
+import gzip
+import email
+import email.policy
+import email.utils
+import re
+import io
+import subprocess
+import textwrap
+from collections import defaultdict
+
+LORE_BASE = "https://lore.kernel.org"
+CONTEXT_LINES = 4  # lines before/after a conversation in truncated mode
+
+
+def usage():
+    print(f"Usage: {sys.argv[0]} <message-id-or-url> [--untruncated]",
+          file=sys.stderr)
+    print(file=sys.stderr)
+    print("Fetches a lore.kernel.org thread and displays it with inline",
+          file=sys.stderr)
+    print("conversations. Default is truncated (only context around replies).",
+          file=sys.stderr)
+    print(file=sys.stderr)
+    print("Options:", file=sys.stderr)
+    print("  --untruncated  Show full patch/cover letter bodies",
+          file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Fetching and parsing
+# ---------------------------------------------------------------------------
+
+def extract_message_id(arg):
+    """Extract a message-id from a URL or raw message-id."""
+    m = re.search(r'lore\.kernel\.org/[^/]+/([^/]+)', arg)
+    if m:
+        return m.group(1)
+    return arg.strip('<>').strip()
+
+
+def fetch_mbox(message_id):
+    """Fetch the thread mbox from lore."""
+    url = f"{LORE_BASE}/all/{message_id}/t.mbox.gz"
+    result = subprocess.run(
+        ["curl", "-sfL", url],
+        capture_output=True, timeout=30
+    )
+    if result.returncode != 0:
+        print(f"Error: failed to fetch {url}", file=sys.stderr)
+        print("curl exit code:", result.returncode, file=sys.stderr)
+        sys.exit(1)
+    return gzip.decompress(result.stdout)
+
+
+def parse_mbox(raw):
+    """Parse raw mbox bytes into a list of email message objects."""
+    messages = []
+    fp = io.BytesIO(raw)
+    current = []
+    for line in fp:
+        if line.startswith(b'From ') and current:
+            msg = email.message_from_bytes(b''.join(current),
+                                           policy=email.policy.default)
+            messages.append(msg)
+            current = []
+        current.append(line)
+    if current:
+        msg = email.message_from_bytes(b''.join(current),
+                                       policy=email.policy.default)
+        messages.append(msg)
+    return messages
+
+
+def get_msgid(msg):
+    mid = msg.get('Message-Id', msg.get('Message-ID', ''))
+    return mid.strip().strip('<>').strip()
+
+
+def get_in_reply_to(msg):
+    irt = msg.get('In-Reply-To', '')
+    if not irt:
+        return None
+    return irt.strip().strip('<>').strip() or None
+
+
+def get_body(msg):
+    body = msg.get_body(preferencelist=('plain',))
+    if body is None:
+        return ""
+    content = body.get_content()
+    if isinstance(content, bytes):
+        content = content.decode('utf-8', errors='replace')
+    return content
+
+
+def build_thread_tree(messages):
+    """Build a tree structure from messages using In-Reply-To headers."""
+    by_id = {}
+    children = defaultdict(list)
+    roots = []
+
+    for msg in messages:
+        mid = get_msgid(msg)
+        by_id[mid] = msg
+        parent = get_in_reply_to(msg)
+        if parent and parent in by_id:
+            children[parent].append(mid)
+        elif parent:
+            children[parent].append(mid)
+        else:
+            roots.append(mid)
+
+    if not roots:
+        all_ids = set(by_id.keys())
+        for mid, msg in by_id.items():
+            parent = get_in_reply_to(msg)
+            if parent not in all_ids:
+                roots.append(mid)
+
+    return by_id, children, roots
+
+
+# ---------------------------------------------------------------------------
+# Participant handles
+# ---------------------------------------------------------------------------
+
+def make_handle(from_str):
+    """Generate a short handle: lowercase first name + first letter of last."""
+    name, addr = email.utils.parseaddr(from_str)
+    if not name:
+        # Use the local part of the email
+        return addr.split('@')[0].lower() if addr else 'unknown'
+    parts = name.split()
+    if len(parts) >= 2:
+        return (parts[0] + parts[-1][0]).lower()
+    return parts[0].lower()
+
+
+def format_participant(from_str):
+    """Return 'handle (Full Name <email>)' string."""
+    name, addr = email.utils.parseaddr(from_str)
+    handle = make_handle(from_str)
+    if name:
+        return f"{handle} ({name} <{addr}>)"
+    return f"{handle} (<{addr}>)"
+
+
+# ---------------------------------------------------------------------------
+# Quote parsing
+# ---------------------------------------------------------------------------
+
+def parse_quote_depth(line):
+    """Parse a line's quote depth and content.
+
+    Returns (depth, content) where depth is the number of '>' chars
+    and content is the remaining text with quote prefixes stripped.
+    Handles whitespace variations: '> > >', '>  >>', '> >', etc.
+    """
+    # Empty or whitespace-only lines are depth 0
+    if not line.strip():
+        return 0, ''
+
+    depth = 0
+    i = 0
+    # Walk through the line counting '>' chars, skipping whitespace between them
+    while i < len(line):
+        if line[i] == '>':
+            depth += 1
+            i += 1
+            # Skip optional space after '>'
+            if i < len(line) and line[i] == ' ':
+                i += 1
+        elif line[i] in ' \t' and depth > 0:
+            # Skip whitespace between '>' chars
+            i += 1
+        else:
+            break
+
+    if depth == 0:
+        return 0, line
+
+    return depth, line[i:]
+
+
+def is_attribution_line(line):
+    """Check if a line is an email attribution like 'On ... wrote:'."""
+    stripped = line.strip()
+    return bool(re.match(r'^On .+ wrote:\s*$', stripped))
+
+
+def is_signature_line(line):
+    """Check for email signature delimiter '-- '."""
+    return line.rstrip() == '--'
+
+
+# ---------------------------------------------------------------------------
+# Conversation segment parsing
+# ---------------------------------------------------------------------------
+
+class ConversationSegment:
+    """A segment of a reply: quoted context + the person's response."""
+    def __init__(self, context_lines, response_lines, quote_depth):
+        self.context_lines = context_lines   # lines from parent (stripped of one > level)
+        self.response_lines = response_lines  # new text from this person
+        self.quote_depth = quote_depth        # the depth of the context quotes
+
+
+def parse_reply_segments(body):
+    """Parse a reply body into conversation segments.
+
+    Returns a list of ConversationSegment objects, each containing
+    quoted context (what's being replied to) and the response text.
+    """
+    lines = body.split('\n')
+    segments = []
+
+    # Strip signature
+    sig_idx = len(lines)
+    for i, line in enumerate(lines):
+        if is_signature_line(line):
+            sig_idx = i
+            break
+    lines = lines[:sig_idx]
+
+    # Parse into runs of (quoted, unquoted)
+    current_context = []
+    current_response = []
+    current_depth = 0
+    in_context = False
+    skip_next_blank = False
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        depth, content = parse_quote_depth(line)
+
+        # Skip attribution lines (On ... wrote:) whether quoted or not
+        if is_attribution_line(line) or (depth > 0 and is_attribution_line(content)):
+            # Also skip the blank line that typically follows
+            skip_next_blank = True
+            i += 1
+            continue
+
+        if skip_next_blank and not line.strip():
+            skip_next_blank = False
+            i += 1
+            continue
+        skip_next_blank = False
+
+        if depth > 0:
+            # This is a quoted line
+            if not in_context:
+                # Save previous segment if we have a response
+                if current_response:
+                    # Trim trailing blank lines from response
+                    while current_response and not current_response[-1].strip():
+                        current_response.pop()
+                    if current_context or current_response:
+                        segments.append(ConversationSegment(
+                            current_context, current_response, current_depth))
+                    current_context = []
+                    current_response = []
+                in_context = True
+                current_depth = depth
+
+            # Strip one level of quoting to get the parent's text
+            current_context.append(content if depth == 1 else
+                                   reconstruct_quote(depth - 1, content))
+        else:
+            # Unquoted line - this is the person's response
+            if in_context:
+                in_context = False
+            current_response.append(line)
+
+        i += 1
+
+    # Final segment
+    if current_response:
+        while current_response and not current_response[-1].strip():
+            current_response.pop()
+    if current_context or current_response:
+        segments.append(ConversationSegment(
+            current_context, current_response, current_depth))
+
+    # Filter out segments that are only blank
+    segments = [s for s in segments
+                if any(l.strip() for l in s.response_lines)]
+
+    return segments
+
+
+def reconstruct_quote(depth, content):
+    """Reconstruct a quoted line with the given depth."""
+    prefix = '> ' * depth
+    return prefix + content
+
+
+def clean_response_lines(lines):
+    """Strip trailing spaces and reflow paragraphs longer than 80 chars."""
+    lines = [l.rstrip() for l in lines]
+
+    def is_verbatim(line):
+        """Lines that must not be joined into a reflowed paragraph."""
+        if not line:
+            return False
+        return line[0] in ' \t+-@\\'
+
+    result = []
+    paragraph = []
+
+    def flush():
+        if not paragraph:
+            return
+        if any(len(l) > 80 for l in paragraph):
+            wrapped = textwrap.fill(' '.join(paragraph), width=80)
+            result.extend(wrapped.split('\n'))
+        else:
+            result.extend(paragraph)
+        paragraph.clear()
+
+    for line in lines:
+        if not line:
+            flush()
+            result.append(line)
+        elif is_verbatim(line):
+            flush()
+            result.append(line)
+        else:
+            paragraph.append(line)
+
+    flush()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Fuzzy matching of quoted text to parent body
+# ---------------------------------------------------------------------------
+
+def normalize_for_match(line):
+    """Normalize a line for fuzzy matching."""
+    return line.strip()
+
+
+def find_context_in_parent(context_lines, parent_lines):
+    """Find where context_lines appear in parent_lines.
+
+    Returns the index in parent_lines of the last matched context line,
+    or -1 if no match found. Handles <snip>/[...] gaps by matching
+    fragments independently.
+    """
+    if not context_lines:
+        return -1
+
+    # Split context into fragments at snip/gap markers
+    fragments = []
+    current_fragment = []
+    for line in context_lines:
+        stripped = line.strip().lower()
+        if stripped in ('<snip>', '[...]', '[snip]', '...', '---', ''):
+            if current_fragment:
+                fragments.append(current_fragment)
+                current_fragment = []
+        else:
+            current_fragment.append(line)
+    if current_fragment:
+        fragments.append(current_fragment)
+
+    if not fragments:
+        return -1
+
+    # Match the LAST fragment to find the insertion point
+    # (the conversation happens after the last quoted context line)
+    last_fragment = fragments[-1]
+    match_idx = find_consecutive_match(last_fragment, parent_lines)
+
+    if match_idx >= 0:
+        return match_idx
+
+    # Fallback: try matching just the last 2 lines of the last fragment
+    if len(last_fragment) > 2:
+        match_idx = find_consecutive_match(last_fragment[-2:], parent_lines)
+        if match_idx >= 0:
+            return match_idx
+
+    # Last resort: try matching the very last non-empty line
+    for line in reversed(last_fragment):
+        if line.strip():
+            norm = normalize_for_match(line)
+            for j, pl in enumerate(parent_lines):
+                if normalize_for_match(pl) == norm:
+                    return j
+            break
+
+    return -1
+
+
+def find_consecutive_match(fragment, parent_lines):
+    """Find a consecutive run of fragment lines in parent_lines.
+
+    Returns the index of the last matched line, or -1.
+    """
+    if not fragment:
+        return -1
+
+    norm_frag = [normalize_for_match(l) for l in fragment]
+    # Skip empty lines at the start of the fragment for matching
+    first_nonempty = 0
+    while first_nonempty < len(norm_frag) and not norm_frag[first_nonempty]:
+        first_nonempty += 1
+    if first_nonempty >= len(norm_frag):
+        return -1
+
+    frag_len = len(norm_frag)
+    for i in range(len(parent_lines) - frag_len + 1):
+        matched = True
+        for j in range(frag_len):
+            if not norm_frag[j]:
+                # Skip blank lines in fragment
+                continue
+            if normalize_for_match(parent_lines[i + j]) != norm_frag[j]:
+                matched = False
+                break
+        if matched:
+            return i + frag_len - 1
+
+    return -1
+
+
+# ---------------------------------------------------------------------------
+# Building annotated documents with inline conversations
+# ---------------------------------------------------------------------------
+
+class Annotation:
+    """A conversation inserted at a specific line in a document."""
+    def __init__(self, line_idx, handle, response_lines, children=None):
+        self.line_idx = line_idx        # line in parent after which to insert
+        self.handle = handle            # who is speaking
+        self.response_lines = response_lines
+        self.children = children or []  # nested Annotation objects
+        self.child_line_idx = -1        # position within parent's response
+
+
+def extract_deepest_content(context_lines):
+    """Extract only lines at the deepest quote level for patch matching.
+
+    In a reply-to-reply, context_lines contain mixed depths:
+    - depth 0: intermediate reviewer's text (don't match)
+    - depth N: original patch text (match these)
+
+    Returns the content of the deepest-quoted lines, stripped of all '>'.
+    """
+    if not context_lines:
+        return []
+
+    parsed = [parse_quote_depth(line) for line in context_lines]
+    max_depth = max((d for d, _ in parsed), default=0)
+
+    if max_depth == 0:
+        # Direct reply - all lines are from the parent, use as-is
+        return [c for _, c in parsed]
+
+    # Only use lines at max depth (original patch content)
+    return [c for d, c in parsed if d >= max_depth]
+
+
+def collect_reply_annotations(mid, by_id, children_map, handles, patch_set):
+    """Collect all annotations for a root patch message, properly nested.
+
+    Walks the reply tree under `mid`, skipping children that are patch
+    messages. For each reply, extracts deepest-quoted lines to match
+    against the root patch body. Nests child replies under their parent
+    reviewer's annotations.
+    """
+    msg = by_id.get(mid)
+    if not msg:
+        return []
+
+    parent_body = get_body(msg)
+    parent_lines = parent_body.split('\n')
+
+    # Find commit message end (--- separator) for default annotation position
+    # General comments go after the commit message, not at line 0
+    default_pos = 0
+    for idx, line in enumerate(parent_lines):
+        if line.strip() == '---':
+            default_pos = idx - 1
+            break
+
+    def process_reply(reply_mid, parent_annotations=None):
+        """Process a reply, match to root patch, nest under parent anns."""
+        reply_msg = by_id.get(reply_mid)
+        if not reply_msg:
+            return []
+
+        reply_handle = handles.get(reply_mid, 'unknown')
+        reply_body = get_body(reply_msg)
+        segments = parse_reply_segments(reply_body)
+
+        reply_annotations = []
+        all_reply_anns = []  # ALL annotations incl. those nested into parents
+        prev_ann = None
+        for seg in segments:
+            # Extract deepest-level lines for matching against root patch
+            search_lines = extract_deepest_content(seg.context_lines)
+
+            match_idx = find_context_in_parent(search_lines, parent_lines)
+
+            response = list(seg.response_lines)
+            while response and not response[0].strip():
+                response = response[1:]
+            while response and not response[-1].strip():
+                response = response[:-1]
+            response = clean_response_lines(response)
+
+            if not response:
+                continue
+
+            # If match failed with very short context (1-2 lines), merge
+            # into previous annotation (handles mid-sentence quote breaks)
+            ctx_nonempty = [l for l in seg.context_lines if l.strip()]
+            if match_idx < 0 and prev_ann and len(ctx_nonempty) <= 2:
+                prev_ann.response_lines.extend([''] + response)
+                continue
+
+            ann = Annotation(
+                line_idx=match_idx if match_idx >= 0 else default_pos,
+                handle=reply_handle,
+                response_lines=response,
+            )
+
+            # If we have parent annotations, try to nest under one
+            if parent_annotations:
+                nested = False
+
+                # Match by content overlap - find the parent annotation
+                # whose response matches the LAST intermediate-depth
+                # quoted text (closest to the actual response).
+                intermediate = [c for d, c in
+                                (parse_quote_depth(cl) for cl in seg.context_lines)
+                                if d == 0 and c.strip()]
+                if intermediate:
+                    best_pa = None
+                    # Search from last intermediate line backward -
+                    # the last quoted text is what's being replied to
+                    for il in reversed(intermediate):
+                        if len(il.strip()) <= 10:
+                            continue
+                        for pa in parent_annotations:
+                            pa_text = ' '.join(l.strip() for l in pa.response_lines)
+                            if il.strip() in pa_text:
+                                best_pa = pa
+                                break
+                        if best_pa:
+                            break
+                    if best_pa:
+                        # Find position within parent's response
+                        ann.child_line_idx = find_context_in_parent(
+                            [il for il in intermediate if il.strip()],
+                            best_pa.response_lines)
+                        best_pa.children.append(ann)
+                        nested = True
+
+                # Fallback: match by position proximity
+                if not nested:
+                    for pa in reversed(parent_annotations):
+                        if pa.line_idx >= 0 and ann.line_idx >= 0 and \
+                           abs(pa.line_idx - ann.line_idx) <= 10:
+                            pa.children.append(ann)
+                            nested = True
+                            break
+
+                if not nested:
+                    reply_annotations.append(ann)
+            else:
+                reply_annotations.append(ann)
+
+            all_reply_anns.append(ann)
+            prev_ann = ann
+
+        # Process children of this reply, nesting under this reply's anns
+        for child_mid in children_map.get(reply_mid, []):
+            if child_mid in patch_set:
+                continue
+            child_anns = process_reply(child_mid,
+                                       parent_annotations=all_reply_anns)
+            reply_annotations.extend(child_anns)
+
+        return reply_annotations
+
+    all_annotations = []
+    for child_mid in children_map.get(mid, []):
+        if child_mid in patch_set:
+            continue
+        all_annotations.extend(process_reply(child_mid))
+
+    return all_annotations
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def render_annotation(ann, indent_level=1):
+    """Render an annotation with > prefix style.
+
+    Level 1: "> handle:" / ">   content"
+    Level 2: ">  > handle:" / ">  >   content"
+    Each level inherits "> " from parent and adds " > ".
+    Children with child_line_idx are inserted inline within the response.
+    Children without are appended at the end.
+    """
+    prefix = "> " + " > " * (indent_level - 1)
+    bare_prefix = prefix.rstrip()
+
+    # Group children by position in parent's response
+    children_by_pos = defaultdict(list)
+    end_children = []
+    for child in ann.children:
+        if child.child_line_idx >= 0:
+            children_by_pos[child.child_line_idx].append(child)
+        else:
+            end_children.append(child)
+
+    lines = []
+    lines.append(f"{prefix}{ann.handle}:")
+    for i, rl in enumerate(ann.response_lines):
+        if rl.strip():
+            lines.append(f"{prefix}  {rl}")
+        else:
+            lines.append(bare_prefix)
+        if i in children_by_pos:
+            for child in children_by_pos[i]:
+                lines.append(bare_prefix)
+                lines.extend(render_annotation(child, indent_level + 1))
+    for child in end_children:
+        lines.append(bare_prefix)
+        lines.extend(render_annotation(child, indent_level + 1))
+    return lines
+
+
+def render_document(body_lines, annotations, truncate=True):
+    """Render a document with annotations inserted inline.
+
+    In truncated mode, only show CONTEXT_LINES before/after each
+    annotation point, collapsing everything else with '...'.
+    """
+    # Group annotations by line index (unmatched go to position 0)
+    ann_by_line = defaultdict(list)
+    for ann in annotations:
+        ann_by_line[max(ann.line_idx, 0)].append(ann)
+
+    if not ann_by_line:
+        if truncate:
+            return []
+        return list(body_lines)
+
+    # Determine which lines to show in truncated mode
+    if truncate:
+        visible = set()
+        for idx in ann_by_line:
+            for i in range(max(0, idx - CONTEXT_LINES),
+                           min(len(body_lines), idx + CONTEXT_LINES + 1)):
+                visible.add(i)
+    else:
+        visible = set(range(len(body_lines)))
+
+    # Render with annotations inserted
+    output = []
+    last_visible = -2  # Track for '...' insertion
+    for i, line in enumerate(body_lines):
+        if i not in visible and truncate:
+            if last_visible == i - 1 or (output and output[-1] != '...'):
+                if not output or output[-1] != '...':
+                    output.append('...')
+            continue
+
+        if truncate and last_visible < i - 1 and output and output[-1] != '...':
+            output.append('...')
+
+        output.append(line)
+        last_visible = i
+
+        # Insert annotations after this line
+        if i in ann_by_line:
+            for ann in ann_by_line[i]:
+                # Remove trailing blank line so separator is flush with diff
+                if output and output[-1] == '':
+                    output.pop()
+                output.append("-" * 72)
+                output.extend(render_annotation(ann))
+                output.append("-" * 72)
+
+    return output
+
+
+
+def get_patch_number(msg):
+    """Extract patch number from subject like [RFC v3 2/4]."""
+    subject = str(msg.get('Subject', ''))
+    m = re.search(r'\b(\d+)/(\d+)\b', subject)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return 0, 0
+
+
+def get_clean_subject(msg):
+    """Get subject without Re: prefix and [PATCH/RFC ...] tag."""
+    subject = str(msg.get('Subject', ''))
+    subject = re.sub(r'^(Re:\s*)+', '', subject, flags=re.IGNORECASE)
+    # Strip [RFC vN N/M] or [PATCH vN N/M] prefix
+    subject = re.sub(r'^\[.*?\]\s*', '', subject)
+    return subject.strip()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    if len(sys.argv) < 2:
+        usage()
+
+    untruncated = '--untruncated' in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    if not args:
+        usage()
+
+    source = args[0]
+
+    # If source is a local file, read it directly
+    if os.path.isfile(source):
+        print(f"Reading mbox from: {source}", file=sys.stderr)
+        with open(source, 'rb') as f:
+            raw = f.read()
+        # Try gzip decompression, fall back to raw
+        try:
+            raw = gzip.decompress(raw)
+        except gzip.BadGzipFile:
+            pass
+        mbox_cache = None
+    else:
+        message_id = extract_message_id(source)
+        print(f"Fetching thread for: {message_id}", file=sys.stderr)
+        raw = fetch_mbox(message_id)
+        mbox_cache = f"/tmp/lore-{message_id}.mbox"
+
+    # Cache mbox for follow-up runs
+    if mbox_cache:
+        with open(mbox_cache, 'wb') as f:
+            f.write(raw)
+        print(f"Cached mbox: {mbox_cache}", file=sys.stderr)
+
+    messages = parse_mbox(raw)
+
+    if not messages:
+        print("No messages found in thread.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Found {len(messages)} messages in thread.", file=sys.stderr)
+
+    by_id, children, roots = build_thread_tree(messages)
+
+    # Build handle map
+    handles = {}
+    for mid, msg in by_id.items():
+        handles[mid] = make_handle(str(msg.get('From', '')))
+
+    # Identify root patches (cover letter + patches) vs replies
+    # Root patches are messages in `roots` or direct children of roots
+    # that look like patches (not Re:)
+    root_patches = []
+    reply_set = set()
+
+    # Find the cover letter (the root with 0/N or the first root)
+    cover_mid = None
+    for r in roots:
+        num, _ = get_patch_number(by_id[r])
+        if num == 0:
+            cover_mid = r
+            break
+    if not cover_mid and roots:
+        cover_mid = roots[0]
+
+    # Collect all patch messages (direct children of cover letter + cover itself)
+    if cover_mid:
+        root_patches.append(cover_mid)
+        for child_mid in children.get(cover_mid, []):
+            child_msg = by_id.get(child_mid)
+            if child_msg:
+                subj = str(child_msg.get('Subject', ''))
+                # It's a patch if it has N/M in subject and no Re:
+                if re.search(r'\d+/\d+', subj) and not subj.startswith('Re:'):
+                    root_patches.append(child_mid)
+
+    # Sort patches by number
+    root_patches.sort(key=lambda m: get_patch_number(by_id[m]))
+
+    # Everything else is a reply
+    patch_set = set(root_patches)
+    for mid in by_id:
+        if mid not in patch_set:
+            reply_set.add(mid)
+
+    # Collect participants
+    submitter_mid = cover_mid or (roots[0] if roots else None)
+    submitter_from = str(by_id[submitter_mid].get('From', '')) if submitter_mid else ''
+    repliers = {}
+    for mid in reply_set:
+        from_str = str(by_id[mid].get('From', ''))
+        handle = make_handle(from_str)
+        if handle != make_handle(submitter_from):
+            repliers[handle] = from_str
+
+    # Also add submitter's replies (when they reply to reviewers)
+    submitter_handle = make_handle(submitter_from)
+
+    # Print header
+    print(f"Submitted by {format_participant(submitter_from)}")
+    if repliers:
+        print("Replies by:")
+        for handle, from_str in sorted(repliers.items()):
+            print(f"  {format_participant(from_str)}")
+    print()
+
+    # Render each patch
+    for mid in root_patches:
+        msg = by_id[mid]
+
+        body = get_body(msg)
+        body_lines = body.rstrip('\n').split('\n')
+
+        # Collect annotations from all replies to this patch
+        annotations = collect_reply_annotations(
+            mid, by_id, children, handles, patch_set)
+
+        # Skip patches with no replies in truncated mode
+        if not annotations and not untruncated:
+            continue
+
+        num, total = get_patch_number(msg)
+        subject = get_clean_subject(msg)
+
+        print(f"{'=' * 72}")
+        print(f"[{num}/{total}] {subject}")
+        print(f"{'=' * 72}")
+
+        truncate = not untruncated
+        rendered = render_document(body_lines, annotations, truncate=truncate)
+        for line in rendered:
+            print(line)
+
+        print()
+
+
+if __name__ == '__main__':
+    main()

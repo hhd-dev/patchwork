@@ -173,6 +173,18 @@ git send-email --confirm=always --thread --no-chain-reply-to \
 
 NEVER SEND EMAIL YOURSELF. Only supply the command so the user can run it.
 
+## Reading lore threads
+
+To read review replies on a kernel mailing list thread, use
+`scripts/agent/lore-replies`:
+```
+scripts/agent/lore-replies <message-id-or-url>
+```
+
+Pass `--untruncated` to show full patch content instead of only the
+lines surrounding review comments. A local mbox file can be used
+instead of a URL.
+
 ## Reviewing patches
 
 Patches must be re-generated before reviewing. Read each patch file, not
