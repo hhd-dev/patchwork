@@ -80,6 +80,20 @@ config HIBERNATION
 
 	  For more information take a look at <file:Documentation/power/swsusp.rst>.
 
+config HIBERNATION_VERIFY
+	bool "Verify hibernation images through a HMAC-SHA256 digest"
+	depends on HIBERNATION
+	select CRYPTO_LIB_SHA256
+	default N
+	help
+	  Compute a HMAC-SHA256 digest of the hibernation image during entry
+	  and store on its header. Then, use it on exit to verify the image
+	  during load. This prevents malicious tampering of the hibernation
+	  image for a specific key. HMAC-SHA256 is used because it complies
+	  with FIPS.
+	  
+	  This setting incurs a non-trivial performance overhead.
+
 config HIBERNATION_SNAPSHOT_DEV
 	bool "Userspace snapshot device"
 	depends on HIBERNATION

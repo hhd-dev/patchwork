@@ -13,10 +13,14 @@
 #define pr_fmt(fmt) "PM: " fmt
 
 #include <crypto/acompress.h>
+#ifdef CONFIG_HIBERNATION_VERIFY
+#include <crypto/sha2.h>
+#endif
 #include <linux/module.h>
 #include <linux/file.h>
 #include <linux/delay.h>
 #include <linux/bitops.h>
+#include <linux/kconfig.h>
 #include <linux/device.h>
 #include <linux/bio.h>
 #include <linux/blkdev.h>
@@ -60,6 +64,10 @@ static bool clean_pages_on_decompress;
  */
 #define MAP_PAGE_ENTRIES	(PAGE_SIZE / sizeof(sector_t) - 1)
 
+#ifdef CONFIG_HIBERNATION_VERIFY
+static const u8 swsusp_hmac_key[] = "swsusp-hmac-sha256-key";
+#endif
+
 /*
  * Number of free pages that are not high.
  */
@@ -98,11 +106,20 @@ struct swap_map_handle {
 	unsigned int k;
 	unsigned long reqd_free_pages;
 	u32 crc32;
+#ifdef CONFIG_HIBERNATION_VERIFY
+	struct hmac_sha256_ctx hmac_ctx;
+	u8	hmac_begin[SHA256_DIGEST_SIZE];
+#endif
 };
 
 struct swsusp_header {
 	char reserved[PAGE_SIZE - 20 - sizeof(sector_t) - sizeof(int) -
-	              sizeof(u32) - sizeof(u32)];
+		      sizeof(u32) - sizeof(u32)
+			  - IS_ENABLED(CONFIG_HIBERNATION_VERIFY) * 2 * SHA256_DIGEST_SIZE];
+#ifdef CONFIG_HIBERNATION_VERIFY
+	u8	hmac_begin[SHA256_DIGEST_SIZE];
+	u8	hmac[SHA256_DIGEST_SIZE];
+#endif
 	u32	hw_sig;
 	u32	crc32;
 	sector_t image;
@@ -110,6 +127,7 @@ struct swsusp_header {
 	char	orig_sig[10];
 	char	sig[10];
 } __packed;
+static_assert(sizeof(struct swsusp_header) == PAGE_SIZE);
 
 static struct swsusp_header *swsusp_header;
 
@@ -316,6 +334,13 @@ static int mark_swapfiles(struct swap_map_handle *handle, unsigned int flags)
 		swsusp_header->flags = flags;
 		if (flags & SF_CRC32_MODE)
 			swsusp_header->crc32 = handle->crc32;
+#ifdef CONFIG_HIBERNATION_VERIFY
+		memcpy(swsusp_header->hmac_begin, handle->hmac_begin, SHA256_DIGEST_SIZE);
+		hmac_sha256_update(&handle->hmac_ctx, (const u8 *)&swsusp_header->hw_sig,
+				   offsetof(struct swsusp_header, sig) -
+				   offsetof(struct swsusp_header, hw_sig));
+		hmac_sha256_final(&handle->hmac_ctx, swsusp_header->hmac);
+#endif
 		error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC,
 				      swsusp_resume_block, swsusp_header);
 	} else {
@@ -539,6 +564,9 @@ static int save_image(struct swap_map_handle *handle,
 		ret = snapshot_read_next(snapshot);
 		if (ret <= 0)
 			break;
+#ifdef CONFIG_HIBERNATION_VERIFY
+		hmac_sha256_update(&handle->hmac_ctx, data_of(*snapshot), PAGE_SIZE);
+#endif
 		ret = swap_write_page(handle, data_of(*snapshot), &hb);
 		if (ret)
 			break;
@@ -571,6 +599,9 @@ struct crc_data {
 	u32 *crc32;                               /* points to handle's crc32 */
 	size_t **unc_len;			  /* uncompressed lengths */
 	unsigned char **unc;			  /* uncompressed data */
+#ifdef CONFIG_HIBERNATION_VERIFY
+	struct hmac_sha256_ctx *hmac_ctx;
+#endif
 };
 
 static struct crc_data *alloc_crc_data(int nr_threads)
@@ -627,9 +658,13 @@ static int crc32_threadfn(void *data)
 		}
 		atomic_set(&d->ready, 0);
 
-		for (i = 0; i < d->run_threads; i++)
+		for (i = 0; i < d->run_threads; i++) {
 			*d->crc32 = crc32_le(*d->crc32,
 			                     d->unc[i], *d->unc_len[i]);
+#ifdef CONFIG_HIBERNATION_VERIFY
+			hmac_sha256_update(d->hmac_ctx, d->unc[i], *d->unc_len[i]);
+#endif
+		}
 		atomic_set_release(&d->stop, 1);
 		wake_up(&d->done);
 	}
@@ -777,6 +812,9 @@ static int save_compressed_image(struct swap_map_handle *handle,
 
 	handle->crc32 = 0;
 	crc->crc32 = &handle->crc32;
+#ifdef CONFIG_HIBERNATION_VERIFY
+	crc->hmac_ctx = &handle->hmac_ctx;
+#endif
 	for (thr = 0; thr < nr_threads; thr++) {
 		crc->unc[thr] = data[thr].unc;
 		crc->unc_len[thr] = &data[thr].unc_len;
@@ -942,6 +980,9 @@ static int enough_swap(unsigned int nr_pages)
  */
 int swsusp_write(unsigned int flags)
 {
+#ifdef CONFIG_HIBERNATION_VERIFY
+	struct hmac_sha256_ctx hmac_ctx;
+#endif
 	struct swap_map_handle handle;
 	struct snapshot_handle snapshot;
 	struct swsusp_info *header;
@@ -970,6 +1011,15 @@ int swsusp_write(unsigned int flags)
 		goto out_finish;
 	}
 	header = (struct swsusp_info *)data_of(snapshot);
+#ifdef CONFIG_HIBERNATION_VERIFY
+	hmac_sha256_init_usingrawkey(&hmac_ctx, swsusp_hmac_key,
+				     sizeof(swsusp_hmac_key) - 1);
+	hmac_sha256_update(&hmac_ctx, (const u8 *)header, PAGE_SIZE);
+	
+	/* Save the first block hmac to allow for early exits */
+	handle.hmac_ctx = hmac_ctx;
+	hmac_sha256_final(&hmac_ctx, handle.hmac_begin);
+#endif
 	error = swap_write_page(&handle, header, NULL);
 	if (!error) {
 		error = (flags & SF_NOCOMPRESS_MODE) ?
@@ -1113,10 +1163,13 @@ static int load_image(struct swap_map_handle *handle,
 		ret = swap_read_page(handle, data_of(*snapshot), &hb);
 		if (ret)
 			break;
-		if (snapshot->sync_read)
+		if (snapshot->sync_read || IS_ENABLED(CONFIG_HIBERNATION_VERIFY))
 			ret = hib_wait_io(&hb);
 		if (ret)
 			break;
+#ifdef CONFIG_HIBERNATION_VERIFY
+		hmac_sha256_update(&handle->hmac_ctx, data_of(*snapshot), PAGE_SIZE);
+#endif
 		if (!(nr_pages % m))
 			pr_info("Image loading progress: %3d%%\n",
 				nr_pages / m * 10);
@@ -1281,6 +1334,9 @@ static int load_compressed_image(struct swap_map_handle *handle,
 
 	handle->crc32 = 0;
 	crc->crc32 = &handle->crc32;
+#ifdef CONFIG_HIBERNATION_VERIFY
+	crc->hmac_ctx = &handle->hmac_ctx;
+#endif
 	for (thr = 0; thr < nr_threads; thr++) {
 		crc->unc[thr] = data[thr].unc;
 		crc->unc_len[thr] = &data[thr].unc_len;
@@ -1527,6 +1583,10 @@ out_clean:
 int swsusp_read(unsigned int *flags_p)
 {
 	int error;
+	#ifdef CONFIG_HIBERNATION_VERIFY
+	struct hmac_sha256_ctx hmac_ctx;
+	u8 hmac[SHA256_DIGEST_SIZE];
+	#endif
 	struct swap_map_handle handle;
 	struct snapshot_handle snapshot;
 	struct swsusp_info *header;
@@ -1541,11 +1601,36 @@ int swsusp_read(unsigned int *flags_p)
 		goto end;
 	if (!error)
 		error = swap_read_page(&handle, header, NULL);
+#ifdef CONFIG_HIBERNATION_VERIFY
+	if (!error) {
+		hmac_sha256_init_usingrawkey(&hmac_ctx, swsusp_hmac_key,
+						sizeof(swsusp_hmac_key) - 1);
+		hmac_sha256_update(&hmac_ctx, (const u8 *)header, PAGE_SIZE);
+		handle.hmac_ctx = hmac_ctx;
+		hmac_sha256_final(&hmac_ctx, hmac);
+		if (memcmp(hmac, swsusp_header->hmac_begin, SHA256_DIGEST_SIZE)) {
+			pr_err("Invalid first block HMAC-SHA256 hibernation digest!\n");
+			error = -ENODATA;
+		}
+	}
+#endif
 	if (!error) {
 		error = (*flags_p & SF_NOCOMPRESS_MODE) ?
 			load_image(&handle, &snapshot, header->pages - 1) :
 			load_compressed_image(&handle, &snapshot, header->pages - 1);
 	}
+#ifdef CONFIG_HIBERNATION_VERIFY
+	if (!error) {
+		hmac_sha256_update(&handle.hmac_ctx, (const u8 *)&swsusp_header->hw_sig,
+				   offsetof(struct swsusp_header, sig) -
+				   offsetof(struct swsusp_header, hw_sig));
+		hmac_sha256_final(&handle.hmac_ctx, hmac);
+		if (memcmp(hmac, swsusp_header->hmac, SHA256_DIGEST_SIZE)) {
+			pr_err("Invalid final HMAC-SHA256 hibernation digest!\n");
+			error = -ENODATA;
+		}
+	}
+#endif
 	swap_reader_finish(&handle);
 end:
 	if (!error)
